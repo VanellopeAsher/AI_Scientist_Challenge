@@ -2,6 +2,7 @@ import os
 import json
 import base64
 from typing import Optional, List
+from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from openai import AsyncOpenAI
@@ -12,6 +13,29 @@ import uvicorn
 load_dotenv()
 
 app = FastAPI(title="Science Arena Challenge Example Submission")
+
+# Token usage log file
+TOKEN_LOG_FILE = "token_use.log"
+
+def log_token_usage(endpoint: str, model: str, prompt_tokens: int, completion_tokens: int, total_tokens: int):
+    """
+    Log token usage to file
+    """
+    try:
+        log_entry = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "endpoint": endpoint,
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens
+        }
+        
+        with open(TOKEN_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        print(f"[token_log] Logged token usage: {total_tokens} tokens (prompt: {prompt_tokens}, completion: {completion_tokens})")
+    except Exception as e:
+        print(f"[token_log] Error logging token usage: {e}")
 
 # Initialize AsyncOpenAI client for LLM models
 client = AsyncOpenAI(
@@ -59,21 +83,29 @@ async def literature_review(request: Request):
         async def generate():
             # Prepare prompt for literature review
             prompt = f"""Conduct a literature review on the following topic:{query}"""
+            model_name = os.getenv("SCI_LLM_MODEL")
 
             # Call LLM model with streaming
             stream = await client.chat.completions.create(
-                model=os.getenv("SCI_LLM_MODEL"),
+                model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=2048,
                 temperature=0.2,
                 stream=True
             )
 
+            # Variables to track token usage and accumulated content
+            prompt_tokens = 0
+            completion_tokens = 0
+            total_tokens = 0
+            accumulated_content = ""
+
             # Stream back results
             async for chunk in stream:
                 if chunk.choices and len(chunk.choices) > 0:
                     delta_content = chunk.choices[0].delta.content
                     if delta_content:
+                        accumulated_content += delta_content
                         response_data = {
                             "object": "chat.completion.chunk",
                             "choices": [{
@@ -83,6 +115,31 @@ async def literature_review(request: Request):
                             }]
                         }
                         yield f"data: {json.dumps(response_data)}\n\n"
+                
+                # Check for usage information in chunk (usually in the last chunk)
+                if hasattr(chunk, 'usage') and chunk.usage:
+                    prompt_tokens = chunk.usage.prompt_tokens or 0
+                    completion_tokens = chunk.usage.completion_tokens or 0
+                    total_tokens = chunk.usage.total_tokens or 0
+
+            # If usage not found in chunks, estimate tokens using simple approximation
+            # (rough estimate: 1 token ≈ 4 characters for English, 1.5 for Chinese)
+            if total_tokens == 0:
+                # Estimate prompt tokens (rough approximation)
+                prompt_tokens = len(prompt) // 3  # Rough estimate
+                # Estimate completion tokens
+                completion_tokens = len(accumulated_content) // 3  # Rough estimate
+                total_tokens = prompt_tokens + completion_tokens
+                print(f"[token_usage] Usage not available from API, using estimation: prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}")
+
+            # Log token usage
+            log_token_usage(
+                endpoint="/literature_review",
+                model=model_name,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens
+            )
 
             yield "data: [DONE]\n\n"
 

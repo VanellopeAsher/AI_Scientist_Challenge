@@ -1,0 +1,3 @@
+python src/integrated_workflow.py --topic "Please comprehensively sort out the latest research of diffusion models in the text modality for me."
+python src/integrated_workflow.py --topic "Conduct a comprehensive search of the latest advances (since 2024) in the field of spatio-temporal data prediction, with a particular focus on key technologies such as spatio-temporal foundation models and large spatio-temporal models. I would like a detailed comparison of the different methods, highlighting their differences. Cite sources."
+python src/integrated_workflow.py --topic "Please help me systematically map out the development history of the world model, and explain how each of the influential representative papers approaches the topic."
