@@ -1,0 +1,6 @@
+The Rise and Potential of LLM Agents
+Large Language Models Empowered Agent-based Modeling and Simulation: A Survey and Perspectives
+A Comprehensive Survey of Scientific Large Language Models and Their Applications in Scientific Discovery
+From AI for Science to Agentic Science: A Survey on Autonomous Scientific Discovery
+Data Agent: A Holistic Architecture for Orchestrating Data+AI Ecosystems
+综述型文章都比较长，可以选一些看看

@@ -1,0 +1,6 @@
+Go et al. 2025. LiRA: A Multi-Agent Framework for Reliable and Readable Literature Review Generation 
+Qi et al. 2025. Generation of Scientific Literature Surveys Based on LLMs and MAS (MASS-Survey) 
+Li et al. 2024. ChatCite: LLM Agent with Human Workflow Guidance for Comparative Literature Summary 
+Zhang et al. 2025. Mixture of Knowledge Minigraph Agents for Literature Review Generation (CKMAs) 
+Agarwal et al. 2025. LitLLMs: LLMs for Literature Review – Are we there yet? 
+Agentic AutoSurvey: Let Agentic LLM Survey LLMs. 2025. (OpenReview Preprint)
