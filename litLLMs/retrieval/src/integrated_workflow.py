@@ -26,6 +26,12 @@ from single_query_retrieval import SingleQueryRetrieval
 from utils.llm_utils import run_llm_api
 from utils.api_utils import get_openalex_candidates
 from utils.paper_manager_utils import get_keywords_for_s2_search
+
+try:
+    from local_ranker import LocalRanker, load_local_ranker_config
+except ImportError:
+    LocalRanker = None
+    load_local_ranker_config = None
 import requests
 import time
 from tqdm import tqdm
@@ -142,6 +148,14 @@ class IntegratedWorkflow:
         
         # 加载prompts
         self.prompts = self.load_prompts()
+
+        self.local_ranker = None
+        if LocalRanker and load_local_ranker_config:
+            lr_config = load_local_ranker_config()
+            if lr_config.get("top_k", 0) < self.config.n_papers_for_generation:
+                lr_config["top_k"] = self.config.n_papers_for_generation
+            if lr_config.get("enabled", True):
+                self.local_ranker = LocalRanker(lr_config)
     
     def load_prompts(self):
         """加载prompt模板"""
@@ -165,6 +179,42 @@ Plan: Generate the related work in [number] lines using max [number] words. Cite
         
         with open(prompts_path, 'r', encoding='utf-8') as f:
             return json.load(f)
+
+    def build_outline_text(self, topic_description, parsed_prompt=None):
+        """组装用于本地LLM评分的提纲段落文本"""
+        outline_parts = []
+        if parsed_prompt:
+            original_prompt = parsed_prompt.get('original_prompt')
+            if original_prompt:
+                outline_parts.append(original_prompt.strip())
+            keywords = parsed_prompt.get('keywords') or []
+            if keywords:
+                outline_parts.append("关键词: " + ", ".join(keywords))
+            if parsed_prompt.get('time_constraint'):
+                outline_parts.append(f"时间范围要求: {parsed_prompt['time_constraint']}")
+            special = parsed_prompt.get('special_requirements') or []
+            if special:
+                outline_parts.append("特殊要求: " + ", ".join(sorted(set(special))))
+        if not outline_parts:
+            outline_parts.append(topic_description.strip())
+        return "\n".join([part for part in outline_parts if part])
+
+    def apply_local_llm_ranking(self, papers, outline_text, topic_description=None):
+        """调用本地LLM排序模块，对候选论文进行四指标评分"""
+        if not self.local_ranker or not papers:
+            return papers
+        try:
+            ranked = self.local_ranker.rank(
+                outline_text=outline_text,
+                candidate_docs=papers,
+                topic_description=topic_description,
+            )
+            if ranked:
+                print(f"\n[LocalRanker] 完成评分。进入后续流程的论文数: {len(ranked)}")
+                return ranked
+        except Exception as exc:
+            print(f"[LocalRanker] 评分阶段出错，回退到原始排序: {exc}")
+        return papers
     
     def format_papers_for_prompt(self, papers, max_papers=40):
         """
@@ -1072,6 +1122,9 @@ Literature Review:
             return None, None, None
         
         print(f"检索完成，找到 {len(papers)} 篇论文")
+
+        outline_text = self.build_outline_text(topic_description, parsed_prompt)
+        papers = self.apply_local_llm_ranking(papers, outline_text, topic_description)
         
         # 步骤2: 选择前N篇论文用于生成
         n_papers = min(self.config.n_papers_for_generation, len(papers))

@@ -119,17 +119,36 @@ def run_openai_api(
         model_name = "deepseek-chat"
         openai_client = openai.OpenAI(
             api_key=DEEPSEEK_API_KEY,
-            base_url=DEEPSEEK_BASE_URL
+            base_url=DEEPSEEK_BASE_URL,
+            timeout=300.0,  # 5分钟超时，用于生成长文本
+            max_retries=3,  # 最多重试3次
         )
-        completion = openai_client.chat.completions.create(
-            model=model_name,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            messages=[
-                {"role": "system", "content": f"{json_data['system_prompt']}"},
-                {"role": "user", "content": f"{json_data['prompt']}"},
-            ],
-        )
+        
+        # 添加重试逻辑
+        import time
+        max_attempts = 3
+        retry_delay = 5  # 重试前等待5秒
+        
+        for attempt in range(max_attempts):
+            try:
+                completion = openai_client.chat.completions.create(
+                    model=model_name,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    messages=[
+                        {"role": "system", "content": f"{json_data['system_prompt']}"},
+                        {"role": "user", "content": f"{json_data['prompt']}"},
+                    ],
+                )
+                break  # 成功则跳出循环
+            except (openai.APIConnectionError, openai.APITimeoutError, Exception) as e:
+                if attempt < max_attempts - 1:
+                    print(f"API调用失败（尝试 {attempt + 1}/{max_attempts}），{retry_delay}秒后重试... 错误: {e}")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # 指数退避
+                else:
+                    print(f"API调用失败，已重试{max_attempts}次，放弃。")
+                    raise
         
         # DeepSeek pricing: $0.14 per 1M input tokens, $0.28 per 1M output tokens (as of 2024)
         usage = completion.usage
