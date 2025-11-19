@@ -26,47 +26,83 @@ from single_query_retrieval import SingleQueryRetrieval
 from utils.llm_utils import run_llm_api
 from utils.api_utils import get_openalex_candidates
 from utils.paper_manager_utils import get_keywords_for_s2_search
-
-try:
-    from local_ranker import LocalRanker, load_local_ranker_config
-except ImportError:
-    LocalRanker = None
-    load_local_ranker_config = None
 import requests
 import time
+import datetime
 from tqdm import tqdm
 
 
 def parse_user_prompt(user_prompt):
     """
-    解析用户prompt，提取关键信息
+    解析用户prompt，提取关键信息和约束条件
     返回：{
         'core_topic': 核心主题（用于检索）,
         'keywords': 关键词列表,
-        'time_constraint': 时间限制（如"since 2024"）,
+        'time_constraint': 时间限制（如"since 2024"），用于硬编码过滤,
+        'time_constraint_type': 时间约束类型（'since', 'after', 'from', 'in', 'during', 'before', 'between'）,
+        'time_range': 时间范围（如果是between，包含start_year和end_year）,
         'special_requirements': 特殊要求（如"comparison", "differences"等）,
+        'language': 语言要求（如"english", "chinese"等）,
+        'paper_type': 论文类型要求（如"journal", "conference", "preprint"）,
+        'focus_areas': 重点关注领域（从"focus on", "particularly"等提取）,
+        'exclude_terms': 排除词（从"not", "exclude", "avoid"等提取）,
+        'min_citations': 最小引用数（如果提到）,
         'original_prompt': 原始prompt
     }
     """
     original_prompt = user_prompt.strip()
+    prompt_lower = original_prompt.lower()
     
-    # 提取时间限制
+    # ========== 1. 提取时间限制（硬编码过滤用）==========
     time_constraint = None
-    time_patterns = [
-        r'since\s+(\d{4})',
-        r'after\s+(\d{4})',
-        r'from\s+(\d{4})',
-        r'(\d{4})\s+onwards',
-        r'in\s+(\d{4})',
-        r'during\s+(\d{4})',
+    time_constraint_type = None
+    time_range = None
+    
+    # 提取"since/after/from YYYY"模式
+    since_patterns = [
+        (r'since\s+(\d{4})', 'since'),
+        (r'after\s+(\d{4})', 'after'),
+        (r'from\s+(\d{4})', 'from'),
+        (r'(\d{4})\s+onwards', 'since'),
     ]
-    for pattern in time_patterns:
+    for pattern, constraint_type in since_patterns:
         match = re.search(pattern, original_prompt, re.IGNORECASE)
         if match:
             time_constraint = match.group(1) if len(match.groups()) > 0 else match.group(0)
+            time_constraint_type = constraint_type
             break
     
-    # 提取特殊要求关键词
+    # 提取"in YYYY"或"during YYYY"（精确年份）
+    if not time_constraint:
+        exact_year_patterns = [
+            (r'in\s+(\d{4})', 'in'),
+            (r'during\s+(\d{4})', 'during'),
+        ]
+        for pattern, constraint_type in exact_year_patterns:
+            match = re.search(pattern, original_prompt, re.IGNORECASE)
+            if match:
+                time_constraint = match.group(1)
+                time_constraint_type = constraint_type
+                break
+    
+    # 提取"before YYYY"
+    if not time_constraint:
+        before_match = re.search(r'before\s+(\d{4})', original_prompt, re.IGNORECASE)
+        if before_match:
+            time_constraint = before_match.group(1)
+            time_constraint_type = 'before'
+    
+    # 提取"between YYYY and YYYY"
+    if not time_constraint:
+        between_match = re.search(r'between\s+(\d{4})\s+and\s+(\d{4})', original_prompt, re.IGNORECASE)
+        if between_match:
+            time_range = {
+                'start_year': between_match.group(1),
+                'end_year': between_match.group(2)
+            }
+            time_constraint_type = 'between'
+    
+    # ========== 2. 提取特殊要求关键词 ==========
     special_requirements = []
     requirement_keywords = [
         'comparison', 'compare', 'comparing',
@@ -76,18 +112,96 @@ def parse_user_prompt(user_prompt):
         'latest', 'recent', 'current',
         'method', 'methods', 'technique', 'techniques',
         'key technology', 'key technologies',
-        'sort out', 'organize', 'summarize'
+        'sort out', 'organize', 'summarize',
+        'systematic', 'systematically',
+        'critical analysis', 'critical',
+        'survey', 'review'
     ]
-    prompt_lower = original_prompt.lower()
     for keyword in requirement_keywords:
         if keyword in prompt_lower:
             special_requirements.append(keyword)
     
-    # 提取核心主题和关键词（使用LLM或简单的关键词提取）
-    # 简单方法：移除常见指令词，提取核心名词短语
-    # 复杂方法可以调用LLM提取
+    # ========== 3. 提取语言要求 ==========
+    language = None
+    language_patterns = [
+        (r'in\s+(english|chinese|spanish|french|german|japanese)', 'language'),
+        (r'written\s+in\s+(\w+)', 'language'),
+    ]
+    for pattern, _ in language_patterns:
+        match = re.search(pattern, prompt_lower)
+        if match:
+            language = match.group(1)
+            break
     
-    # 先尝试简单提取：移除常见的指令词
+    # ========== 4. 提取论文类型要求 ==========
+    paper_type = None
+    if 'journal' in prompt_lower or 'journal article' in prompt_lower:
+        paper_type = 'journal'
+    elif 'conference' in prompt_lower or 'proceeding' in prompt_lower:
+        paper_type = 'conference'
+    elif 'preprint' in prompt_lower or 'arxiv' in prompt_lower:
+        paper_type = 'preprint'
+    
+    # ========== 5. 提取重点关注领域（改进：验证和清理）==========
+    focus_areas = []
+    focus_patterns = [
+        r'focus\s+on\s+([^.,;]+)',
+        r'focusing\s+on\s+([^.,;]+)',
+        r'particularly\s+([^.,;]+)',
+        r'especially\s+([^.,;]+)',
+        r'with\s+a\s+focus\s+on\s+([^.,;]+)',
+    ]
+    for pattern in focus_patterns:
+        matches = re.findall(pattern, original_prompt, re.IGNORECASE)
+        for match in matches:
+            focus_text = match.strip()
+            # 验证：长度合理，不是常见停用词
+            if focus_text and 3 <= len(focus_text.split()) <= 10:
+                # 移除常见的无意义词
+                cleaned = re.sub(r'\b(please|the|a|an|and|or|on|in|at|to|for|of|with|by)\b', '', focus_text, flags=re.IGNORECASE).strip()
+                if cleaned and len(cleaned.split()) >= 2:
+                    focus_areas.append(cleaned)
+    
+    # 去重
+    focus_areas = list(dict.fromkeys(focus_areas))  # 保持顺序的去重
+    
+    # ========== 6. 提取排除词（改进：更精确的提取）==========
+    exclude_terms = []
+    exclude_patterns = [
+        r'(?:do\s+)?not\s+(?:include|use|consider|mention)\s+([^.,;]+)',
+        r'exclude\s+([^.,;]+)',
+        r'avoid\s+([^.,;]+)',
+        r'without\s+([^.,;]+)',
+        r'not\s+([^.,;]+?)(?:\.|,|;|$)',
+    ]
+    for pattern in exclude_patterns:
+        matches = re.findall(pattern, original_prompt, re.IGNORECASE)
+        for match in matches:
+            exclude_text = match.strip()
+            # 验证：长度合理，不是常见停用词
+            if exclude_text and 1 <= len(exclude_text.split()) <= 5:
+                # 移除常见的无意义词
+                cleaned = re.sub(r'\b(please|the|a|an|and|or|on|in|at|to|for|of|with|by)\b', '', exclude_text, flags=re.IGNORECASE).strip()
+                if cleaned:
+                    exclude_terms.append(cleaned)
+    
+    # 去重
+    exclude_terms = list(dict.fromkeys(exclude_terms))
+    
+    # ========== 7. 提取最小引用数 ==========
+    min_citations = None
+    citation_patterns = [
+        r'at\s+least\s+(\d+)\s+citations?',
+        r'minimum\s+(\d+)\s+citations?',
+        r'more\s+than\s+(\d+)\s+citations?',
+    ]
+    for pattern in citation_patterns:
+        match = re.search(pattern, prompt_lower)
+        if match:
+            min_citations = int(match.group(1))
+            break
+    
+    # ========== 8. 提取核心主题和关键词 ==========
     instruction_words = [
         'conduct', 'please', 'i would like', 'i need', 'i want',
         'sort out', 'organize', 'comprehensive', 'detailed',
@@ -108,7 +222,6 @@ def parse_user_prompt(user_prompt):
         core_topic = original_prompt
     
     # 提取关键词（简单的名词短语提取）
-    # 这里可以改进为使用更复杂的NLP方法
     keywords = []
     # 提取引号内的内容
     quoted = re.findall(r'["\']([^"\']+)["\']', original_prompt)
@@ -119,14 +232,326 @@ def parse_user_prompt(user_prompt):
     tech_matches = re.findall(tech_pattern, original_prompt, re.IGNORECASE)
     keywords.extend([t.strip() for t in tech_matches])
     
+    # ========== 9. 约束冲突检测和验证 ==========
+    constraint_conflicts = []
+    warnings = []
+    
+    # 检测时间约束冲突
+    if time_constraint and 'latest' in special_requirements:
+        constraint_year = int(time_constraint) if time_constraint.isdigit() else None
+        if constraint_year and constraint_year < 2020:
+            constraint_conflicts.append(f"时间约束({time_constraint})与'latest'要求可能冲突")
+    
+    if time_constraint and 'recent' in special_requirements:
+        constraint_year = int(time_constraint) if time_constraint.isdigit() else None
+        if constraint_year and constraint_year < 2022:
+            warnings.append(f"时间约束({time_constraint})可能不够'recent'，建议使用2022年之后")
+    
+    # 检测排除词与重点关注领域的冲突
+    if exclude_terms and focus_areas:
+        for exclude_term in exclude_terms:
+            for focus_area in focus_areas:
+                if exclude_term.lower() in focus_area.lower() or focus_area.lower() in exclude_term.lower():
+                    warnings.append(f"排除词'{exclude_term}'与重点关注'{focus_area}'可能存在冲突")
+    
+    # 验证时间约束的合理性
+    if time_constraint and time_constraint.isdigit():
+        constraint_year = int(time_constraint)
+        current_year = datetime.datetime.now().year
+        if constraint_year > current_year:
+            warnings.append(f"时间约束({time_constraint})是未来年份，将自动调整为当前年份")
+            time_constraint = str(current_year)
+        elif constraint_year < 1900:
+            warnings.append(f"时间约束({time_constraint})过旧，可能无法找到相关论文")
+    
+    # 验证最小引用数的合理性
+    if min_citations and min_citations > 1000:
+        warnings.append(f"最小引用数({min_citations})过高，可能过滤掉大部分论文")
+    
+    # 输出警告和冲突信息
+    if constraint_conflicts:
+        print("警告: 检测到约束冲突:")
+        for conflict in constraint_conflicts:
+            print(f"  - {conflict}")
+    
+    if warnings:
+        print("提示:")
+        for warning in warnings:
+            print(f"  - {warning}")
+    
     return {
         'core_topic': core_topic,
         'keywords': keywords if keywords else [],
-        'time_constraint': time_constraint,
+        'time_constraint': time_constraint,  # 年份字符串，用于硬编码过滤
+        'time_constraint_type': time_constraint_type,  # 约束类型
+        'time_range': time_range,  # 如果是between，包含start_year和end_year
         'special_requirements': special_requirements,
-        'original_prompt': original_prompt
+        'language': language,
+        'paper_type': paper_type,
+        'focus_areas': focus_areas,
+        'exclude_terms': exclude_terms,
+        'min_citations': min_citations,
+        'original_prompt': original_prompt,
+        'conflicts': constraint_conflicts,  # 冲突列表
+        'warnings': warnings  # 警告列表
     }
 
+
+def parse_date_with_month(date_str):
+    """
+    解析日期字符串，提取年份和月份
+    支持多种格式：
+    - "2024-01-15" -> (2024, 1)
+    - "2024-01" -> (2024, 1)
+    - "2024/01/15" -> (2024, 1)
+    - "2024" -> (2024, None)
+    - "January 2024" -> (2024, 1)
+    - "Jan 2024" -> (2024, 1)
+    返回: (year, month) 或 (year, None) 如果无法解析月份
+    """
+    if not date_str or date_str == 'Unknown':
+        return None, None
+    
+    date_str = str(date_str).strip()
+    
+    # 模式1: YYYY-MM-DD 或 YYYY-MM
+    match = re.search(r'(\d{4})-(\d{1,2})(?:-(\d{1,2}))?', date_str)
+    if match:
+        year = int(match.group(1))
+        month = int(match.group(2))
+        return year, month
+    
+    # 模式2: YYYY/MM/DD 或 YYYY/MM
+    match = re.search(r'(\d{4})/(\d{1,2})(?:/(\d{1,2}))?', date_str)
+    if match:
+        year = int(match.group(1))
+        month = int(match.group(2))
+        return year, month
+    
+    # 模式3: Month YYYY (January 2024, Jan 2024)
+    month_names = {
+        'january': 1, 'jan': 1, 'february': 2, 'feb': 2,
+        'march': 3, 'mar': 3, 'april': 4, 'apr': 4,
+        'may': 5, 'june': 6, 'jun': 6, 'july': 7, 'jul': 7,
+        'august': 8, 'aug': 8, 'september': 9, 'sep': 9, 'sept': 9,
+        'october': 10, 'oct': 10, 'november': 11, 'nov': 11,
+        'december': 12, 'dec': 12
+    }
+    match = re.search(r'([a-z]+)\s+(\d{4})', date_str.lower())
+    if match:
+        month_name = match.group(1)
+        year = int(match.group(2))
+        month = month_names.get(month_name)
+        if month:
+            return year, month
+    
+    # 模式4: 仅年份 YYYY
+    match = re.search(r'(\d{4})', date_str)
+    if match:
+        year = int(match.group(1))
+        return year, None
+    
+    return None, None
+
+
+def calculate_retrieval_count(base_n_candidates, constraints=None, target_citations=50):
+    """
+    根据约束条件和目标引用数量计算实际需要的检索数量
+    目标：确保过滤后有足够的论文用于生成（至少是目标引用数量的3-4倍）
+    
+    Args:
+        base_n_candidates: 基础检索数量
+        constraints: 约束条件字典（可选）
+        target_citations: 目标引用数量（默认50）
+    
+    Returns: 调整后的检索数量
+    """
+    # 基础策略：为了获得约50个引用，需要检索更多论文
+    # 考虑到过滤会减少论文数量，检索数量应该是目标引用数量的6-8倍
+    min_retrieval_count = target_citations * 6  # 至少300篇（50 * 6），确保过滤后有足够论文
+    
+    # 如果基础数量已经足够，使用基础数量
+    if base_n_candidates >= min_retrieval_count:
+        adjusted_count = base_n_candidates
+    else:
+        # 如果基础数量不足，至少使用最小检索数量
+        adjusted_count = min_retrieval_count
+    
+    # 如果有约束条件，进一步增加检索数量
+    if constraints:
+        multiplier = 1.0
+        
+        # 时间约束：如果有时间限制，需要更多检索
+        if constraints.get('time_constraint') or constraints.get('time_range'):
+            multiplier += 0.5  # 增加50%
+        
+        # 最小引用数：如果有引用数要求，需要更多检索
+        if constraints.get('min_citations'):
+            multiplier += 0.5  # 增加50%
+        
+        # 排除词：如果有排除词，需要更多检索
+        exclude_terms = constraints.get('exclude_terms', [])
+        if exclude_terms:
+            multiplier += len(exclude_terms) * 0.3  # 每个排除词增加30%
+            multiplier = min(multiplier, 2.0)  # 排除词最多增加100%
+        
+        # 论文类型要求：如果有类型限制，需要更多检索
+        if constraints.get('paper_type'):
+            multiplier += 0.3
+        
+        # 语言要求：如果有语言限制，需要更多检索
+        if constraints.get('language'):
+            multiplier += 0.2
+        
+        # 应用倍数
+        adjusted_count = int(adjusted_count * multiplier)
+    
+    # 设置上限，避免检索过多（最多800篇，确保有足够候选）
+    adjusted_count = min(adjusted_count, 800)
+    
+    return adjusted_count
+
+
+def filter_papers_by_constraints(papers, constraints):
+    """
+    根据约束条件硬编码过滤论文
+    constraints: parse_user_prompt返回的约束字典
+    返回: 过滤后的论文列表
+    """
+    if not papers or not constraints:
+        return papers
+    
+    filtered_papers = []
+    original_count = len(papers)
+    
+    # ========== 1. 年份和月份过滤（硬编码）==========
+    time_constraint = constraints.get('time_constraint')
+    time_constraint_type = constraints.get('time_constraint_type')
+    time_range = constraints.get('time_range')
+    
+    if time_constraint or time_range:
+        # 解析约束日期（支持年份和月份）
+        constraint_year = None
+        constraint_month = None
+        if time_constraint:
+            # 尝试解析约束日期（可能是 "2024-01" 或 "2024"）
+            constraint_year, constraint_month = parse_date_with_month(time_constraint)
+            if constraint_year is None:
+                # 如果无法解析，尝试直接提取年份
+                year_match = re.search(r'(\d{4})', time_constraint)
+                if year_match:
+                    constraint_year = int(year_match.group(1))
+        
+        for paper in papers:
+            pub_date = paper.get('publication_date', 'Unknown')
+            if pub_date == 'Unknown':
+                # 如果日期未知，保留论文（避免过度过滤）
+                filtered_papers.append(paper)
+                continue
+            
+            # 解析论文日期（支持年份和月份）
+            paper_year, paper_month = parse_date_with_month(pub_date)
+            if paper_year is None:
+                # 如果无法解析日期，保留论文（避免过度过滤）
+                filtered_papers.append(paper)
+                continue
+            
+            # 根据约束类型过滤
+            should_include = True
+            
+            if time_range and time_constraint_type == 'between':
+                # between YYYY and YYYY
+                start_year = int(time_range['start_year'])
+                end_year = int(time_range['end_year'])
+                should_include = start_year <= paper_year <= end_year
+            elif constraint_year is not None:
+                if time_constraint_type in ['since', 'after', 'from']:
+                    # since/after/from YYYY-MM: 包含该日期及之后
+                    if constraint_month and paper_month:
+                        # 比较年月
+                        constraint_date = constraint_year * 12 + constraint_month
+                        paper_date = paper_year * 12 + paper_month
+                        should_include = paper_date >= constraint_date
+                    else:
+                        # 仅比较年份
+                        should_include = paper_year >= constraint_year
+                elif time_constraint_type == 'before':
+                    # before YYYY-MM: 不包含该日期
+                    if constraint_month and paper_month:
+                        constraint_date = constraint_year * 12 + constraint_month
+                        paper_date = paper_year * 12 + paper_month
+                        should_include = paper_date < constraint_date
+                    else:
+                        should_include = paper_year < constraint_year
+                elif time_constraint_type in ['in', 'during']:
+                    # in/during YYYY-MM: 精确日期匹配
+                    if constraint_month and paper_month:
+                        should_include = (paper_year == constraint_year and 
+                                        paper_month == constraint_month)
+                    else:
+                        # 仅年份匹配
+                        should_include = paper_year == constraint_year
+            
+            if should_include:
+                filtered_papers.append(paper)
+        
+        papers = filtered_papers
+        filtered_papers = []
+        print(f"  日期过滤: {original_count} -> {len(papers)} 篇论文")
+    
+    # ========== 2. 最小引用数过滤 ==========
+    min_citations = constraints.get('min_citations')
+    if min_citations:
+        original_count = len(papers)
+        for paper in papers:
+            citation_count = paper.get('citation_count', 0)
+            if isinstance(citation_count, str) and citation_count != 'Unknown':
+                try:
+                    citation_count = int(citation_count)
+                except:
+                    citation_count = 0
+            elif citation_count == 'Unknown':
+                citation_count = 0
+            
+            if citation_count >= min_citations:
+                filtered_papers.append(paper)
+        
+        papers = filtered_papers
+        filtered_papers = []
+        print(f"  引用数过滤(≥{min_citations}): {original_count} -> {len(papers)} 篇论文")
+    
+    # ========== 3. 排除词过滤（改进：更精确的匹配）==========
+    exclude_terms = constraints.get('exclude_terms', [])
+    if exclude_terms:
+        original_count = len(papers)
+        # 清理和验证排除词
+        cleaned_exclude_terms = []
+        for term in exclude_terms:
+            term = term.strip().lower()
+            # 过滤掉太短或太长的词（可能是误提取）
+            if 2 <= len(term) <= 50 and term not in ['the', 'a', 'an', 'and', 'or', 'not']:
+                cleaned_exclude_terms.append(term)
+        
+        if cleaned_exclude_terms:
+            for paper in papers:
+                title = paper.get('title_paper', '').lower()
+                abstract = paper.get('abstract', '').lower()
+                text = f"{title} {abstract}"
+                
+                should_exclude = False
+                for term in cleaned_exclude_terms:
+                    # 使用单词边界匹配，避免部分匹配
+                    if re.search(r'\b' + re.escape(term) + r'\b', text):
+                        should_exclude = True
+                        break
+                
+                if not should_exclude:
+                    filtered_papers.append(paper)
+            
+            papers = filtered_papers
+            print(f"  排除词过滤: {original_count} -> {len(papers)} 篇论文")
+    
+    return papers
 
 class IntegratedWorkflow:
     """集成的检索-生成工作流类"""
@@ -148,14 +573,6 @@ class IntegratedWorkflow:
         
         # 加载prompts
         self.prompts = self.load_prompts()
-
-        self.local_ranker = None
-        if LocalRanker and load_local_ranker_config:
-            lr_config = load_local_ranker_config()
-            if lr_config.get("top_k", 0) < self.config.n_papers_for_generation:
-                lr_config["top_k"] = self.config.n_papers_for_generation
-            if lr_config.get("enabled", True):
-                self.local_ranker = LocalRanker(lr_config)
     
     def load_prompts(self):
         """加载prompt模板"""
@@ -179,42 +596,6 @@ Plan: Generate the related work in [number] lines using max [number] words. Cite
         
         with open(prompts_path, 'r', encoding='utf-8') as f:
             return json.load(f)
-
-    def build_outline_text(self, topic_description, parsed_prompt=None):
-        """组装用于本地LLM评分的提纲段落文本"""
-        outline_parts = []
-        if parsed_prompt:
-            original_prompt = parsed_prompt.get('original_prompt')
-            if original_prompt:
-                outline_parts.append(original_prompt.strip())
-            keywords = parsed_prompt.get('keywords') or []
-            if keywords:
-                outline_parts.append("关键词: " + ", ".join(keywords))
-            if parsed_prompt.get('time_constraint'):
-                outline_parts.append(f"时间范围要求: {parsed_prompt['time_constraint']}")
-            special = parsed_prompt.get('special_requirements') or []
-            if special:
-                outline_parts.append("特殊要求: " + ", ".join(sorted(set(special))))
-        if not outline_parts:
-            outline_parts.append(topic_description.strip())
-        return "\n".join([part for part in outline_parts if part])
-
-    def apply_local_llm_ranking(self, papers, outline_text, topic_description=None):
-        """调用本地LLM排序模块，对候选论文进行四指标评分"""
-        if not self.local_ranker or not papers:
-            return papers
-        try:
-            ranked = self.local_ranker.rank(
-                outline_text=outline_text,
-                candidate_docs=papers,
-                topic_description=topic_description,
-            )
-            if ranked:
-                print(f"\n[LocalRanker] 完成评分。进入后续流程的论文数: {len(ranked)}")
-                return ranked
-        except Exception as exc:
-            print(f"[LocalRanker] 评分阶段出错，回退到原始排序: {exc}")
-        return papers
     
     def format_papers_for_prompt(self, papers, max_papers=40):
         """
@@ -412,31 +793,65 @@ Plan: Generate the related work in [number] lines using max [number] words. Cite
         
         return papers
     
-    def search_multiple_sources(self, topic_description, sources=['arxiv', 'openalex']):
+    def search_multiple_sources(self, topic_description, sources=['arxiv', 'openalex'], constraints=None, n_candidates_override=None):
         """
         从多个数据源检索论文
         sources: 数据源列表，可选 ['arxiv', 'openalex', 'crossref', 'openreview', 'unpaywall']
+        constraints: 约束条件字典（从parse_user_prompt获取）
+        n_candidates_override: 覆盖默认的n_candidates值
         """
         all_papers = []
         seen_titles = set()
         
-        # 生成搜索查询
-        retrieval = SingleQueryRetrieval(self.config)
+        # 使用覆盖的n_candidates或默认值
+        n_candidates = n_candidates_override if n_candidates_override is not None else self.config.n_candidates
+        
+        # 创建临时config使用调整后的n_candidates
+        temp_config_for_search = self.config._replace(n_candidates=n_candidates)
+        
+        # 从约束中提取年份用于API查询
+        query_publication_date = None
+        if constraints:
+            time_constraint = constraints.get('time_constraint')
+            time_constraint_type = constraints.get('time_constraint_type')
+            if time_constraint and time_constraint_type in ['since', 'after', 'from']:
+                # 对于since/after/from，使用该年份作为查询参数
+                query_publication_date = time_constraint
+        
+        # 生成搜索查询 - 使用调整后的config
+        retrieval = SingleQueryRetrieval(temp_config_for_search)
         query = retrieval.generate_arxiv_query(topic_description)
         
         print(f"\n从多个数据源检索论文: {', '.join(sources)}")
+        print(f"目标检索数量: {n_candidates} 篇（每个源将检索更多以确保有足够论文）")
+        if query_publication_date:
+            print(f"年份约束: {time_constraint_type} {query_publication_date}")
+        if n_candidates_override:
+            print(f"检索数量已根据约束条件调整: {self.config.n_candidates} -> {n_candidates}")
+        
+        # 根据数据源数量动态分配每个源的检索数量
+        # 每个源至少检索 n_candidates 的 1.5 倍，以确保有足够候选论文
+        source_count = len(sources)
+        papers_per_source = int(n_candidates * 1.5 / source_count) if source_count > 0 else n_candidates
         
         # arXiv检索
         if 'arxiv' in sources:
             print("\n[1/{}] 从arXiv检索...".format(len(sources)))
             try:
-                arxiv_papers = retrieval.search_arxiv(query, max_results=self.config.n_candidates // len(sources) + 20)
+                # 动态计算arXiv检索数量
+                arxiv_max_results = max(papers_per_source, 100)  # 至少100篇
+                print(f"  arXiv检索目标: {arxiv_max_results} 篇 (基于n_candidates={n_candidates}动态计算)")
+                arxiv_papers = retrieval.search_arxiv(query, max_results=arxiv_max_results)
+                # 限制返回数量，但保留更多候选
+                arxiv_papers = arxiv_papers[:arxiv_max_results]
+                arxiv_unique_count = 0
                 for paper in arxiv_papers:
                     title = paper.get('title_paper', '').lower()
                     if title and title not in seen_titles:
                         seen_titles.add(title)
                         all_papers.append(paper)
-                print(f"从arXiv获得 {len(arxiv_papers)} 篇论文")
+                        arxiv_unique_count += 1
+                print(f"从arXiv获得 {arxiv_unique_count} 篇唯一论文")
             except Exception as e:
                 print(f"arXiv检索失败: {e}")
         
@@ -451,9 +866,13 @@ Plan: Generate the related work in [number] lines using max [number] words. Cite
                 if query_data and query_data.get("queries"):
                     queries = query_data.get("queries", [])
                     for q in queries[:2]:  # 使用前2个关键词查询
+                        # 动态计算每个查询的检索数量
+                        openalex_n_candidates = max(papers_per_source // len(queries), 50)  # 每个查询至少50篇
+                        print(f"  OpenAlex查询 '{q[:50]}...' 检索目标: {openalex_n_candidates} 篇 (基于n_candidates={n_candidates}动态计算)")
                         openalex_papers = get_openalex_candidates(
                             query=q,
-                            n_candidates=self.config.n_candidates // (len(sources) * 2) + 10
+                            n_candidates=openalex_n_candidates,
+                            query_publication_date=query_publication_date or "2024"
                         )
                         for paper in openalex_papers:
                             title = paper.get('title_paper', '').lower()
@@ -469,9 +888,12 @@ Plan: Generate the related work in [number] lines using max [number] words. Cite
             source_idx += 1
             print(f"\n[{source_idx}/{len(sources)}] 从CrossRef检索...")
             try:
+                # 动态计算CrossRef检索数量
+                crossref_max_results = max(papers_per_source, 100)  # 至少100篇
+                print(f"  CrossRef检索目标: {crossref_max_results} 篇 (基于n_candidates={n_candidates}动态计算)")
                 crossref_papers = self.search_crossref(
                     query, 
-                    max_results=self.config.n_candidates // len(sources) + 10
+                    max_results=crossref_max_results
                 )
                 crossref_count = 0
                 for paper in crossref_papers:
@@ -489,9 +911,12 @@ Plan: Generate the related work in [number] lines using max [number] words. Cite
             source_idx += 1
             print(f"\n[{source_idx}/{len(sources)}] 从OpenReview检索...")
             try:
+                # 动态计算OpenReview检索数量
+                openreview_max_results = max(papers_per_source, 100)  # 至少100篇
+                print(f"  OpenReview检索目标: {openreview_max_results} 篇 (基于n_candidates={n_candidates}动态计算)")
                 openreview_papers = self.search_openreview(
                     query,
-                    max_results=self.config.n_candidates // len(sources) + 10
+                    max_results=openreview_max_results
                 )
                 openreview_count = 0
                 for paper in openreview_papers:
@@ -529,14 +954,31 @@ Plan: Generate the related work in [number] lines using max [number] words. Cite
         print(f"核心主题: {topic_description}")
         print(f"使用 {len(papers)} 篇论文")
         
-        # 格式化输入
-        ref_text, formatted_papers = self.format_papers_for_prompt(papers, max_papers=self.config.n_papers_for_generation)
+        # 格式化输入 - 使用约50篇论文（根据实际情况调整）
+        target_citation_count = 50
+        # 如果论文数量少于50，使用所有论文；如果多于50，使用50篇左右
+        if len(papers) <= target_citation_count:
+            max_papers_to_use = len(papers)
+            actual_citation_count = len(papers)
+        else:
+            max_papers_to_use = min(target_citation_count, self.config.n_papers_for_generation)
+            actual_citation_count = max_papers_to_use
         
-        # 构建特殊要求说明
+        ref_text, formatted_papers = self.format_papers_for_prompt(papers, max_papers=max_papers_to_use)
+        
+        # 构建特殊要求说明（增强版，包含所有约束）
         requirements_text = ""
         if parsed_prompt:
+            # 时间约束
             if parsed_prompt.get('time_constraint'):
-                requirements_text += f"\n- Time constraint: Focus on papers since {parsed_prompt['time_constraint']} (if applicable)\n"
+                constraint_type = parsed_prompt.get('time_constraint_type', 'since')
+                if constraint_type == 'between' and parsed_prompt.get('time_range'):
+                    time_range = parsed_prompt['time_range']
+                    requirements_text += f"\n- Time constraint: Focus on papers between {time_range['start_year']} and {time_range['end_year']}\n"
+                else:
+                    requirements_text += f"\n- Time constraint: Focus on papers {constraint_type} {parsed_prompt['time_constraint']}\n"
+            
+            # 特殊要求关键词
             if parsed_prompt.get('special_requirements'):
                 reqs = parsed_prompt['special_requirements']
                 if any('compar' in r for r in reqs) or any('differ' in r for r in reqs):
@@ -545,27 +987,55 @@ Plan: Generate the related work in [number] lines using max [number] words. Cite
                     requirements_text += f"- MUST emphasize the latest and most recent advances\n"
                 if any('comprehensive' in r or 'detailed' in r for r in reqs):
                     requirements_text += f"- MUST be comprehensive and detailed\n"
+                if any('systematic' in r for r in reqs):
+                    requirements_text += f"- MUST provide systematic analysis and organization\n"
+                if any('critical' in r for r in reqs):
+                    requirements_text += f"- MUST include critical analysis and evaluation\n"
+            
+            # 重点关注领域
+            focus_areas = parsed_prompt.get('focus_areas', [])
+            if focus_areas:
+                requirements_text += f"- MUST particularly focus on: {', '.join(focus_areas[:3])}\n"  # 最多显示3个
+            
+            # 语言要求
+            language = parsed_prompt.get('language')
+            if language:
+                requirements_text += f"- Language requirement: Papers should be in {language}\n"
+            
+            # 论文类型要求
+            paper_type = parsed_prompt.get('paper_type')
+            if paper_type:
+                requirements_text += f"- Paper type: Prefer {paper_type} papers\n"
+            
+            # 最小引用数（已在过滤阶段处理，这里仅作为提示）
+            min_citations = parsed_prompt.get('min_citations')
+            if min_citations:
+                requirements_text += f"- Citation requirement: Papers should have at least {min_citations} citations\n"
         
-        # 构建plan生成的prompt
+        # 构建plan生成的prompt（缩短长度，根据实际情况调整50个引用）
         plan_prompt = f"""You are an expert researcher planning a concise literature review based on the following user request:
 
 User Request: "{parsed_prompt.get('original_prompt', topic_description) if parsed_prompt else topic_description}"
 
 CRITICAL REQUIREMENTS:
 1. MUST strictly focus on the core topic: "{topic_description}"
-2. MUST cite ALL {len(formatted_papers)} provided references (from @cite_1 to @cite_{len(formatted_papers)}) - this is MANDATORY
-3. MUST organize the review into 3-4 main sections with brief subsections, approximately 2500-3000 words total
+2. **MANDATORY: MUST cite EXACTLY {target_citation_count} references (from @cite_1 to @cite_{len(formatted_papers)}) - this is ABSOLUTELY REQUIRED**
+   - You have {len(formatted_papers)} references available
+   - You MUST cite EXACTLY {target_citation_count} different references (NOT fewer, aim for {target_citation_count})
+   - This is a HARD REQUIREMENT: cite {target_citation_count} references, not 30, not 40, but {target_citation_count}
+   - Distribute citations evenly across all sections
+3. MUST organize the review into 3 main sections with brief subsections, approximately 1300-1700 words total
 4. MUST create a concise narrative that covers key aspects, methods, and contributions related to the topic
 5. MUST include critical analysis and comparisons where relevant
-6. MUST ensure every single one of the {len(formatted_papers)} references is cited at least once
+6. **CRITICAL: The References section MUST contain EXACTLY {target_citation_count} entries - verify this before finishing**
 {requirements_text}
 
 Generate a focused plan that outlines:
-- The overall structure (3-4 main sections with brief subsections, total ~2500-3000 words)
-- How you will cite ALL {len(formatted_papers)} references across sections (list which references go in which section)
+- The overall structure (3 main sections with brief subsections, total ~1300-1700 words)
+- **A detailed citation plan: EXACTLY which {target_citation_count} references will be cited in which section (you MUST plan to cite {target_citation_count} references, list them explicitly by number)**
 - The key themes for each section (be concise and focused)
 - The logical flow between sections
-- A citation distribution plan ensuring all {len(formatted_papers)} references are used
+- **A citation distribution plan: Section 1 will cite X references, Section 2 will cite Y references, Section 3 will cite Z references, where X+Y+Z = {target_citation_count} (you MUST specify the exact numbers)**
 - How to address any special requirements from the user request
 
 Topic: {topic_description}
@@ -577,7 +1047,7 @@ Plan:"""
 
         json_data = {
             "prompt": plan_prompt,
-            "system_prompt": f"You are a professional researcher creating concise literature review plans. You MUST ensure all {len(formatted_papers)} references are cited. Create focused plans for 2500-3000 word reviews with 3-4 main sections."
+            "system_prompt": f"You are a professional researcher creating comprehensive literature review plans. You MUST cite EXACTLY {target_citation_count} references (NOT fewer than {target_citation_count}). Create detailed plans for 1300-1700 word reviews with 3 main sections. The plan MUST specify exactly {target_citation_count} references to be cited."
         }
         
         print(f"Plan Prompt长度: {len(plan_prompt.split())} words")
@@ -616,14 +1086,31 @@ Plan:"""
         """
         print(f"\n[步骤2/2] 根据plan生成文献综述...")
         
-        # 格式化输入
-        ref_text, formatted_papers = self.format_papers_for_prompt(papers, max_papers=self.config.n_papers_for_generation)
+        # 格式化输入 - 使用约50篇论文（与plan保持一致）
+        target_citation_count = 50
+        # 如果论文数量少于50，使用所有论文；如果多于50，使用50篇左右
+        if len(papers) <= target_citation_count:
+            max_papers_to_use = len(papers)
+            actual_citation_count = len(papers)
+        else:
+            max_papers_to_use = min(target_citation_count, self.config.n_papers_for_generation)
+            actual_citation_count = max_papers_to_use
         
-        # 构建特殊要求说明
+        ref_text, formatted_papers = self.format_papers_for_prompt(papers, max_papers=max_papers_to_use)
+        
+        # 构建特殊要求说明（增强版，包含所有约束）
         requirements_text = ""
         if parsed_prompt:
+            # 时间约束
             if parsed_prompt.get('time_constraint'):
-                requirements_text += f"\n- Time focus: Emphasize papers and advances since {parsed_prompt['time_constraint']} (if applicable)\n"
+                constraint_type = parsed_prompt.get('time_constraint_type', 'since')
+                if constraint_type == 'between' and parsed_prompt.get('time_range'):
+                    time_range = parsed_prompt['time_range']
+                    requirements_text += f"\n- Time focus: Emphasize papers and advances between {time_range['start_year']} and {time_range['end_year']}\n"
+                else:
+                    requirements_text += f"\n- Time focus: Emphasize papers and advances {constraint_type} {parsed_prompt['time_constraint']}\n"
+            
+            # 特殊要求关键词
             if parsed_prompt.get('special_requirements'):
                 reqs = parsed_prompt['special_requirements']
                 if any('compar' in r for r in reqs) or any('differ' in r for r in reqs):
@@ -633,8 +1120,27 @@ Plan:"""
                     requirements_text += f"- MUST emphasize the latest and most recent advances in the field\n"
                 if any('comprehensive' in r or 'detailed' in r for r in reqs):
                     requirements_text += f"- MUST provide comprehensive coverage and detailed analysis\n"
+                if any('systematic' in r for r in reqs):
+                    requirements_text += f"- MUST organize content systematically and logically\n"
+                if any('critical' in r for r in reqs):
+                    requirements_text += f"- MUST include critical evaluation and analysis of each method\n"
+            
+            # 重点关注领域
+            focus_areas = parsed_prompt.get('focus_areas', [])
+            if focus_areas:
+                requirements_text += f"- MUST particularly emphasize: {', '.join(focus_areas[:3])}\n"
+            
+            # 语言要求
+            language = parsed_prompt.get('language')
+            if language:
+                requirements_text += f"- Language: Ensure all cited papers are in {language}\n"
+            
+            # 论文类型要求
+            paper_type = parsed_prompt.get('paper_type')
+            if paper_type:
+                requirements_text += f"- Paper type: Prioritize discussion of {paper_type} papers\n"
         
-        # 构建review生成的prompt
+        # 构建review生成的prompt（缩短长度，约50个引用）
         user_request = parsed_prompt.get('original_prompt', topic_description) if parsed_prompt else topic_description
         review_prompt = f"""You are an expert researcher writing a concise literature review based on the following user request:
 
@@ -648,17 +1154,19 @@ CRITICAL REQUIREMENTS:
 2. MUST strictly follow the provided plan structure
 3. MUST strictly focus on the core topic: "{topic_description}"
 4. MUST address the specific requirements mentioned in the user request{requirements_text}
-5. **MANDATORY: MUST cite ALL {len(formatted_papers)} provided references (from @cite_1 to @cite_{len(formatted_papers)})**
-   - **EVERY SINGLE REFERENCE MUST BE CITED AT LEAST ONCE**
-   - **DO NOT skip any references - all {len(formatted_papers)} references must appear in your text**
-   - **Count your citations: you must have exactly {len(formatted_papers)} different citations**
+5. **ABSOLUTELY MANDATORY: MUST cite EXACTLY {target_citation_count} references (from @cite_1 to @cite_{len(formatted_papers)}) - NOT 30, NOT 40, but {target_citation_count}**
+   - **You have {len(formatted_papers)} references available**
+   - **You MUST cite EXACTLY {target_citation_count} different references (NOT fewer)**
+   - **This is a HARD REQUIREMENT: {target_citation_count} citations minimum**
+   - **Count your citations as you write: you need {target_citation_count} different citations**
+   - **If you have cited fewer than {target_citation_count} references, you MUST add more citations until you reach {target_citation_count}**
 6. MUST write in academic style with proper paragraph structure
-7. MUST be approximately 2500-3000 words (8-10 paragraphs, organized into 3-4 main sections with brief subsections)
+7. MUST be approximately 1300-1700 words (6-8 paragraphs, organized into 3 main sections with brief subsections)
 8. MUST include critical analysis and comparisons where relevant
 9. MUST use standard citation format: [@cite_X] within the text (where X is the reference number)
    - Use [@cite_1], [@cite_2], etc. as you cite them
    - Each citation will be automatically renumbered to [1], [2], [3] in order of first appearance
-10. MUST end with a "References" section listing all {len(formatted_papers)} cited papers in the order they FIRST appear, using standard academic format:
+10. MUST end with a "References" section listing all cited papers (approximately {target_citation_count} papers) in the order they FIRST appear, using standard academic format:
     [1] Author, A., & Author, B. (Year). Title. Journal/Conference, Details.
     [2] Author, C. (Year). Title. Journal/Conference, Details.
     etc.
@@ -672,14 +1180,15 @@ References:
 ```{ref_text}```
 
 CRITICAL REMINDERS: 
-- **YOU MUST CITE ALL {len(formatted_papers)} REFERENCES - THIS IS MANDATORY**
-- **Every single reference from @cite_1 to @cite_{len(formatted_papers)} MUST appear in your text at least once**
-- **Before finishing, verify you have cited all {len(formatted_papers)} references**
-- **The References section MUST contain exactly {len(formatted_papers)} entries**
-- Keep the review concise: 2500-3000 words total, 3-4 main sections
-- Be clear and focused - avoid unnecessary verbosity
-- Each section should be 1-2 paragraphs with brief subsections
-- Distribute all {len(formatted_papers)} references across sections - do not cluster them
+- **YOU MUST CITE EXACTLY {target_citation_count} REFERENCES - THIS IS MANDATORY, NOT OPTIONAL**
+- **Select {target_citation_count} references from the {len(formatted_papers)} provided - you MUST use {target_citation_count} different references**
+- **Before finishing, COUNT your citations: you MUST have EXACTLY {target_citation_count} different citations (NOT 30, NOT 40, but {target_citation_count})**
+- **The References section MUST contain EXACTLY {target_citation_count} entries - verify this is correct before finishing**
+- **If you have fewer than {target_citation_count} citations, you MUST add more until you reach {target_citation_count}**
+- Keep the review comprehensive: 1300-1700 words total, 3 main sections
+- Be clear and detailed - provide thorough analysis
+- Each section should be 2-3 paragraphs with brief subsections
+- Distribute the references (around {target_citation_count}) across sections - do not cluster them
 - Use the format [@cite_1], [@cite_2], etc. within the text
 
 Literature Review:
@@ -688,7 +1197,7 @@ Literature Review:
 
         json_data = {
             "prompt": review_prompt,
-            "system_prompt": f"You are a professional researcher writing concise literature reviews. You MUST cite all {len(formatted_papers)} references. Write 2500-3000 word reviews with 3-4 main sections. Be concise, clear, and ensure every reference is used."
+            "system_prompt": f"You are a professional researcher writing comprehensive literature reviews. You MUST cite EXACTLY {target_citation_count} references (NOT fewer than {target_citation_count}). Write 1300-1700 word reviews with 3 main sections. Be thorough, clear, and ensure EXACTLY {target_citation_count} different references are cited. Count your citations and verify you have {target_citation_count} before finishing."
         }
         
         print(f"Review Prompt长度: {len(review_prompt.split())} words")
@@ -1100,19 +1609,42 @@ Literature Review:
         # 如果提供了parsed_prompt，使用core_topic进行检索
         search_topic = parsed_prompt.get('core_topic', topic_description) if parsed_prompt else topic_description
         
-        # 步骤1: 检索论文
+        # 步骤1: 检索论文（根据约束条件动态调整检索数量）
         print("\n[步骤1/3] 检索相关论文...")
         print(f"检索主题: {search_topic}")
         
+        # 计算实际需要的检索数量（确保有足够论文用于约50个引用）
+        target_citations = 50
+        original_n_candidates = self.config.n_candidates
+        adjusted_n_candidates = calculate_retrieval_count(
+            base_n_candidates=original_n_candidates,
+            constraints=parsed_prompt,
+            target_citations=target_citations
+        )
+        
+        if adjusted_n_candidates > original_n_candidates:
+            print(f"根据目标引用数量({target_citations})和约束条件，调整检索数量: {original_n_candidates} -> {adjusted_n_candidates}")
+        else:
+            print(f"使用基础检索数量: {adjusted_n_candidates} (目标: 至少{target_citations * 6}篇以确保有足够论文)")
+        
+        # 确保至少检索300篇
+        if adjusted_n_candidates < 300:
+            print(f"警告: 检索数量({adjusted_n_candidates})少于建议值(300)，自动调整为300")
+            adjusted_n_candidates = 300
+        
+        # 创建临时config使用调整后的检索数量
+        temp_config = self.config._replace(n_candidates=adjusted_n_candidates)
+        
         # 如果配置了多源检索，使用多源检索
         if hasattr(self.config, 'search_sources') and self.config.search_sources:
-            papers = self.search_multiple_sources(search_topic, self.config.search_sources)
+            papers = self.search_multiple_sources(search_topic, self.config.search_sources, constraints=parsed_prompt, n_candidates_override=temp_config.n_candidates)
         else:
-            retrieval = SingleQueryRetrieval(self.config)
+            retrieval = SingleQueryRetrieval(temp_config)
             if self.config.skip_rerank:
                 # 跳过重排序，直接搜索
                 arxiv_query = retrieval.generate_arxiv_query(search_topic)
-                papers = retrieval.search_arxiv(arxiv_query)
+                # 使用调整后的检索数量
+                papers = retrieval.search_arxiv(arxiv_query, max_results=adjusted_n_candidates)
             else:
                 # 完整流程：搜索 + LLM重排序
                 papers = retrieval.retrieve(search_topic)
@@ -1122,14 +1654,68 @@ Literature Review:
             return None, None, None
         
         print(f"检索完成，找到 {len(papers)} 篇论文")
-
-        outline_text = self.build_outline_text(topic_description, parsed_prompt)
-        papers = self.apply_local_llm_ranking(papers, outline_text, topic_description)
         
-        # 步骤2: 选择前N篇论文用于生成
-        n_papers = min(self.config.n_papers_for_generation, len(papers))
+        # 步骤1.5: 根据约束条件硬编码过滤论文
+        if parsed_prompt:
+            print(f"\n[步骤1.5/3] 根据约束条件过滤论文...")
+            # 保存原始论文列表（过滤前）
+            original_papers_list = papers.copy()  # 保存完整列表
+            papers_before_filter = len(papers)
+            papers = filter_papers_by_constraints(papers, parsed_prompt)
+            
+            if not papers:
+                print("错误：过滤后未找到任何符合条件的论文")
+                print("建议：")
+                print("  1. 检查约束条件是否过于严格")
+                print("  2. 尝试放宽时间约束或引用数要求")
+                print("  3. 减少排除词数量")
+                return None, None, None
+            
+            papers_after_filter = len(papers)
+            filter_ratio = papers_after_filter / papers_before_filter if papers_before_filter > 0 else 0
+            print(f"过滤完成: {papers_before_filter} -> {papers_after_filter} 篇论文 (保留 {filter_ratio*100:.1f}%)")
+            
+            # 如果过滤后论文数量仍然不足，尝试放宽约束重新过滤
+            min_required_papers = max(10, self.config.n_papers_for_generation)  # 至少需要10篇或配置值
+            if papers_after_filter < min_required_papers:
+                print(f"\n警告: 过滤后论文数量({papers_after_filter}篇)少于建议值({min_required_papers}篇)")
+                print("尝试放宽部分约束条件并重新过滤...")
+                
+                # 创建放宽的约束（移除部分严格约束）
+                relaxed_constraints = parsed_prompt.copy()
+                # 放宽最小引用数（如果有）
+                if relaxed_constraints.get('min_citations'):
+                    original_min_citations = relaxed_constraints['min_citations']
+                    relaxed_constraints['min_citations'] = max(1, original_min_citations // 2)
+                    print(f"  放宽最小引用数: {original_min_citations} -> {relaxed_constraints['min_citations']}")
+                
+                # 减少排除词（如果有）
+                if relaxed_constraints.get('exclude_terms'):
+                    original_exclude_count = len(relaxed_constraints['exclude_terms'])
+                    relaxed_constraints['exclude_terms'] = relaxed_constraints['exclude_terms'][:max(1, original_exclude_count // 2)]
+                    print(f"  减少排除词数量: {original_exclude_count} -> {len(relaxed_constraints['exclude_terms'])}")
+                
+                # 使用放宽的约束重新过滤原始论文列表
+                relaxed_papers = filter_papers_by_constraints(original_papers_list.copy(), relaxed_constraints)
+                if len(relaxed_papers) > papers_after_filter:
+                    print(f"  放宽约束后获得 {len(relaxed_papers)} 篇论文（增加 {len(relaxed_papers) - papers_after_filter} 篇）")
+                    papers = relaxed_papers
+                    papers_after_filter = len(papers)
+                    # 更新parsed_prompt以反映放宽的约束（用于后续生成）
+                    parsed_prompt = relaxed_constraints
+                else:
+                    print("  放宽约束后仍未获得足够论文，使用原始过滤结果")
+            
+            # 如果过滤后论文数量过少，给出最终建议
+            if papers_after_filter < 5:
+                print(f"\n警告: 过滤后论文数量较少({papers_after_filter}篇)，可能影响综述质量")
+                print("建议考虑放宽部分约束条件")
+        
+        # 步骤2: 选择前N篇论文用于生成（确保使用50篇）
+        target_papers = 50  # 固定使用50篇
+        n_papers = min(target_papers, len(papers))
         selected_papers = papers[:n_papers]
-        print(f"\n[步骤2/3] 选择前 {n_papers} 篇论文用于生成（配置值: {self.config.n_papers_for_generation}，实际使用: {n_papers}）...")
+        print(f"\n[步骤2/3] 选择前 {n_papers} 篇论文用于生成（目标: {target_papers}篇，配置值: {self.config.n_papers_for_generation}，实际使用: {n_papers}）...")
         if n_papers < self.config.n_papers_for_generation:
             print(f"注意: 检索到的论文数量({len(papers)})少于配置值({self.config.n_papers_for_generation})，实际使用 {n_papers} 篇论文")
         
@@ -1345,15 +1931,15 @@ def parse_args():
         "-k",
         "--n_candidates",
         type=int,
-        default=50,
-        help="检索的候选论文数量（默认50）"
+        default=200,
+        help="检索的候选论文数量（默认200，确保有足够论文用于约50个引用）"
     )
     
     parser.add_argument(
         "--n_papers_for_generation",
         type=int,
-        default=40,
-        help="用于生成综述的论文数量（默认40，建议35-40）"
+        default=50,
+        help="用于生成综述的论文数量（默认50，用于约50个引用）"
     )
     
     parser.add_argument(
@@ -1522,4 +2108,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

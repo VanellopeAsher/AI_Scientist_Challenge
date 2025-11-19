@@ -1,6 +1,7 @@
 import pandas as pd
 import os
 
+from matplotlib.ticker import FormatStrFormatter
 import openpyxl
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
