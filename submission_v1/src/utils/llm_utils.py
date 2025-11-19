@@ -7,15 +7,21 @@ import pandas as pd
 from tqdm import tqdm
 
 
-from .vllm import infer_vllm
-
 # Set openai credentials
 openai.api_key = os.environ.get("OPENAI_API_KEY")
 
 # Set deepseek credentials
 # Read API key from environment variable SCI_MODEL_API_KEY (required by competition rules)
 DEEPSEEK_API_KEY = os.environ.get("SCI_MODEL_API_KEY")
-DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+# Read base URL from environment variable SCI_MODEL_BASE_URL (with default for backward compatibility)
+# Default includes /v1 suffix as required by OpenAI-compatible API
+default_base_url = "https://api.deepseek.com/v1"
+base_url_from_env = os.environ.get("SCI_MODEL_BASE_URL")
+if base_url_from_env:
+    # Ensure the URL ends with /v1 if not already present
+    DEEPSEEK_BASE_URL = base_url_from_env if base_url_from_env.endswith("/v1") else f"{base_url_from_env.rstrip('/')}/v1"
+else:
+    DEEPSEEK_BASE_URL = default_base_url
 
 
 def extract_ids(papers_string):
@@ -72,7 +78,7 @@ def run_llm_api(
 ) -> dict:
     """
     This function actually calls the OpenAI API
-    Models such as 'gpt-4o-mini', 'deepseek-chat', and 'llama-*' are available
+    Models such as 'gpt-4o-mini' and 'deepseek-chat' are available
     :param json_data:
     :return: dict with 'response', 'usage', 'cost' keys (for backward compatibility, can return str if needed)
     """
@@ -80,19 +86,9 @@ def run_llm_api(
         return run_openai_api(json_data, gen_engine, max_tokens, temperature, use_deepseek=True)
     elif "gpt" in gen_engine:
         return run_openai_api(json_data, gen_engine, max_tokens, temperature)
-    elif "llama" in gen_engine:
-        response = infer_vllm(
-            prompt=json_data["prompt"],
-            max_tokens=max_tokens,
-            end_point=gen_engine,
-            temperature=temperature,
-        )
-        # For vllm, we don't have usage info, return dict with response only
-        return {
-            "response": response,
-            "usage": None,
-            "cost": 0
-        }
+    else:
+        # Fallback to OpenAI API for other models
+        return run_openai_api(json_data, gen_engine, max_tokens, temperature)
 
 
 def run_openai_api(
