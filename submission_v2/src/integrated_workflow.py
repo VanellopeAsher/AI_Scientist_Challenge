@@ -557,12 +557,14 @@ def filter_papers_by_constraints(papers, constraints):
 class IntegratedWorkflow:
     """集成的检索-生成工作流类"""
     
-    def __init__(self, config):
+    def __init__(self, config, progress_callback=None):
         """
         初始化工作流
         config: 包含配置参数的namedtuple
+        progress_callback: 进度回调函数，接收(step, message)参数
         """
         self.config = config
+        self.progress_callback = progress_callback
         # 可选加载spacy模型（当前未使用，保留以备将来需要）
         self.nlp_spacy = None
         if SPACY_AVAILABLE:
@@ -574,6 +576,15 @@ class IntegratedWorkflow:
         
         # 加载prompts
         self.prompts = self.load_prompts()
+    
+    def _report_progress(self, step, message):
+        """报告进度"""
+        if self.progress_callback:
+            try:
+                self.progress_callback(step, message)
+            except Exception as e:
+                # 忽略回调错误，不影响主流程
+                pass
     
     def load_prompts(self):
         """加载prompt模板"""
@@ -1614,6 +1625,7 @@ Literature Review:
         print("\n[步骤1/3] 检索相关论文...")
         print(f"检索主题: {search_topic}")
         print("使用新的4因子评分系统：检索150篇 -> 评分 -> 选择top 40篇")
+        self._report_progress("1/3", f"检索相关论文: {search_topic}")
         
         # 根据新需求，初始检索150篇
         initial_retrieval_count = 150
@@ -1645,6 +1657,7 @@ Literature Review:
             return None, None, None
         
         print(f"检索完成，找到 {len(papers)} 篇论文")
+        self._report_progress("1/3", f"检索完成，找到 {len(papers)} 篇论文")
         
         # 如果使用多源检索或skip_rerank，需要手动应用4因子评分
         if (hasattr(self.config, 'search_sources') and self.config.search_sources) or self.config.skip_rerank:
@@ -1654,6 +1667,7 @@ Literature Review:
             
             if not self.config.skip_rerank:
                 print(f"\n[步骤1.5/3] 使用4因子评分系统对 {len(papers)} 篇论文进行重排序...")
+                self._report_progress("1.5/3", f"使用4因子评分系统对 {len(papers)} 篇论文进行重排序")
                 local_ranker = LocalRanker(self.config)
                 scored_papers = local_ranker.rerank_papers(
                     outline_paragraph=search_topic,
@@ -1663,10 +1677,12 @@ Literature Review:
                 # 提取原始论文对象
                 papers = [item["paper"] for item in scored_papers]
                 print(f"重排序完成，选择前 {len(papers)} 篇论文")
+                self._report_progress("1.5/3", f"重排序完成，选择前 {len(papers)} 篇论文")
         
         # 步骤1.5: 根据约束条件硬编码过滤论文
         if parsed_prompt:
             print(f"\n[步骤1.5/3] 根据约束条件过滤论文...")
+            self._report_progress("1.5/3", "根据约束条件过滤论文")
             # 保存原始论文列表（过滤前）
             original_papers_list = papers.copy()  # 保存完整列表
             papers_before_filter = len(papers)
@@ -1683,6 +1699,7 @@ Literature Review:
             papers_after_filter = len(papers)
             filter_ratio = papers_after_filter / papers_before_filter if papers_before_filter > 0 else 0
             print(f"过滤完成: {papers_before_filter} -> {papers_after_filter} 篇论文 (保留 {filter_ratio*100:.1f}%)")
+            self._report_progress("1.5/3", f"过滤完成: {papers_before_filter} -> {papers_after_filter} 篇论文")
             
             # 如果过滤后论文数量仍然不足，尝试放宽约束重新过滤
             min_required_papers = max(10, self.config.n_papers_for_generation)  # 至少需要10篇或配置值
@@ -1725,12 +1742,15 @@ Literature Review:
         n_papers = min(target_papers, len(papers))
         selected_papers = papers[:n_papers]
         print(f"\n[步骤2/3] 选择前 {n_papers} 篇论文用于生成（目标: {target_papers}篇，配置值: {self.config.n_papers_for_generation}，实际使用: {n_papers}）...")
+        self._report_progress("2/3", f"选择前 {n_papers} 篇论文用于生成")
         if n_papers < self.config.n_papers_for_generation:
             print(f"注意: 检索到的论文数量({len(papers)})少于配置值({self.config.n_papers_for_generation})，实际使用 {n_papers} 篇论文")
         
         # 步骤3: 生成plan和文献综述
         print(f"\n[步骤3/3] 生成plan和文献综述...")
+        self._report_progress("3/3", "生成plan和文献综述")
         plan, review, references, usage_info, cost, formatted_papers = self.generate_plan_and_review(topic_description, selected_papers, parsed_prompt)
+        self._report_progress("3/3", "文献综述生成完成")
         
         # 如果没有生成references，根据review中的引用顺序生成
         # 这部分已经在generate_plan_and_review中处理，这里不需要重复处理

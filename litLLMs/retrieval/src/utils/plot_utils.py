@@ -1,15 +1,8 @@
 import os
 import numpy as np
 import pandas as pd
-
-try:
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import FormatStrFormatter
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
-    plt = None
-    FormatStrFormatter = None
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FormatStrFormatter
 
 from .llm_utils import extract_ids, parse_papers_reranking
 
@@ -133,9 +126,6 @@ def calculate_metrics_at_k(k, df_ground_truth, df_cite, df_rerank):
 
 
 def plot_metrics(df_ground_truth, df_cite, df_rerank):
-    if not MATPLOTLIB_AVAILABLE:
-        raise ImportError("matplotlib is required for plotting. Please install it with: pip install matplotlib")
-    
     # Assuming extract_ids and parse_papers_reranking are defined elsewhere
     df_ground_truth["ground_references_ids"] = df_ground_truth[
         "cited_references"

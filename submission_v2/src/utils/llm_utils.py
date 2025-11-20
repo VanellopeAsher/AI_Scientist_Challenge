@@ -9,25 +9,30 @@ from dotenv import dotenv_values
 
 from .vllm import infer_vllm
 
-# Load environment variables from .env file only (not from system environment)
+# Load environment variables: first from system environment (for Docker), then from .env file (for local dev)
 # Find .env file in the retrieval directory (parent of src directory)
 current_file_dir = os.path.dirname(os.path.abspath(__file__))
 retrieval_dir = os.path.dirname(os.path.dirname(current_file_dir))  # Go up from src/utils to retrieval
 env_file_path = os.path.join(retrieval_dir, ".env")
-env_vars = dotenv_values(env_file_path)
 
-# Set openai credentials
-openai.api_key = env_vars.get("OPENAI_API_KEY")
+# Try to load from .env file if it exists
+env_vars = {}
+if os.path.exists(env_file_path):
+    env_vars = dotenv_values(env_file_path)
 
-# Model credentials must be provided via SCI_* environment variables in .env file per contest rules
-SCI_MODEL_API_KEY = env_vars.get("SCI_MODEL_API_KEY")
-SCI_MODEL_BASE_URL = env_vars.get("SCI_MODEL_BASE_URL")
+# Set openai credentials (prefer system env, then .env file)
+openai.api_key = os.getenv("OPENAI_API_KEY") or env_vars.get("OPENAI_API_KEY")
 
-# Validate that required environment variables are present in .env file
+# Model credentials must be provided via SCI_* environment variables
+# Prefer system environment variables (for Docker), fallback to .env file (for local dev)
+SCI_MODEL_API_KEY = os.getenv("SCI_MODEL_API_KEY") or env_vars.get("SCI_MODEL_API_KEY")
+SCI_MODEL_BASE_URL = os.getenv("SCI_MODEL_BASE_URL") or env_vars.get("SCI_MODEL_BASE_URL")
+
+# Validate that required environment variables are present
 if not SCI_MODEL_API_KEY:
-    raise ValueError(f"SCI_MODEL_API_KEY is required in .env file but not found. Please add it to {env_file_path}")
+    raise ValueError(f"SCI_MODEL_API_KEY is required but not found. Please set it as an environment variable or add it to {env_file_path}")
 if not SCI_MODEL_BASE_URL:
-    raise ValueError(f"SCI_MODEL_BASE_URL is required in .env file but not found. Please add it to {env_file_path}")
+    raise ValueError(f"SCI_MODEL_BASE_URL is required but not found. Please set it as an environment variable or add it to {env_file_path}")
 
 
 def extract_ids(papers_string):
